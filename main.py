@@ -1,18 +1,18 @@
-
 from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-import pandas_datareader as pdr
 import numpy as np
 import asyncio
 import logging
+import urllib.request
+import csv
+import io
 from datetime import datetime, timedelta
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = FastAPI()
-
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -51,56 +51,79 @@ def calc_rrs(my_bars, bench_bars, length, mult):
     return float(np.clip(ema, -20, 20))
 
 
-def get_bars(symbol: str, days: int = 90):
-    """Télécharge via Stooq (pas bloqué par Render, gratuit, sans API key)."""
+def get_bars(symbol: str, days: int = 120):
+    """
+    Télécharge les données OHLC via l'API CSV de Stooq.
+    Utilise uniquement urllib — aucune dépendance externe.
+    """
     end   = datetime.today()
     start = end - timedelta(days=days)
+    d1 = start.strftime("%Y%m%d")
+    d2 = end.strftime("%Y%m%d")
+
+    # Stooq: suffixe .US pour les actions américaines
+    sym = f"{symbol}.US".lower()
+    url = f"https://stooq.com/q/d/l/?s={sym}&d1={d1}&d2={d2}&i=d"
+
     try:
-        # Stooq utilise le suffixe .US pour les actions américaines
-        stooq_sym = f"{symbol}.US" if "." not in symbol else symbol
-        df = pdr.get_data_stooq(stooq_sym, start=start, end=end)
-        if df is None or df.empty:
-            # Retry sans suffixe
-            df = pdr.get_data_stooq(symbol, start=start, end=end)
-        if df is None or df.empty or len(df) < 15:
-            logger.warning(f"{symbol}: données vides depuis Stooq")
+        req = urllib.request.Request(url, headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0"
+        })
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            raw = resp.read().decode("utf-8")
+
+        if "No data" in raw or len(raw) < 50:
+            logger.warning(f"{symbol}: pas de données Stooq")
             return None, None, None
-        df = df.sort_index()  # Stooq retourne en ordre décroissant
-        bars  = df[["High", "Low", "Close"]].dropna().to_numpy(dtype=float)
-        if len(bars) < 15:
+
+        reader = csv.DictReader(io.StringIO(raw))
+        rows   = list(reader)
+        if not rows or len(rows) < 15:
             return None, None, None
-        price = float(bars[-1, 2])
-        chg   = 0.0
-        if "Open" in df.columns:
-            opens = df["Open"].dropna().to_numpy(dtype=float)
-            if len(opens) > 0 and opens[-1] > 0:
-                chg = round((price - float(opens[-1])) / float(opens[-1]) * 100, 2)
+
+        # Stooq retourne en ordre décroissant — on inverse
+        rows.reverse()
+
+        highs, lows, closes, opens = [], [], [], []
+        for r in rows:
+            try:
+                highs.append(float(r["High"]))
+                lows.append(float(r["Low"]))
+                closes.append(float(r["Close"]))
+                opens.append(float(r.get("Open", r["Close"])))
+            except (ValueError, KeyError):
+                continue
+
+        if len(closes) < 15:
+            return None, None, None
+
+        bars  = np.column_stack([highs, lows, closes])
+        price = closes[-1]
+        chg   = round((closes[-1] - opens[-1]) / opens[-1] * 100, 2) if opens[-1] > 0 else 0.0
         logger.info(f"{symbol} OK: {len(bars)} barres, prix={price:.2f}")
         return bars, price, chg
+
     except Exception as e:
-        logger.error(f"{symbol} erreur Stooq: {e}")
+        logger.error(f"{symbol} erreur: {e}")
         return None, None, None
 
 
 @app.get("/")
 def root():
-    return {"status": "ok", "name": "Trinity RRS Scanner", "source": "Stooq"}
-
+    return {"status": "ok", "name": "Trinity RRS Scanner", "source": "Stooq CSV"}
 
 @app.get("/health")
 def health():
     return {"status": "ok", "message": "Trinity RRS Backend opérationnel"}
-
 
 @app.get("/test/{symbol}")
 async def test(symbol: str):
     loop = asyncio.get_event_loop()
     bars, price, chg = await loop.run_in_executor(None, lambda: get_bars(symbol.upper()))
     if bars is None:
-        return {"symbol": symbol.upper(), "status": "ERREUR", "bars": 0,
-                "hint": "Stooq ne couvre pas tous les tickers (ETFs parfois absents)"}
-    return {"symbol": symbol.upper(), "status": "OK", "bars": len(bars), "price": round(price, 2)}
-
+        return {"symbol": symbol.upper(), "status": "ERREUR", "bars": 0}
+    return {"symbol": symbol.upper(), "status": "OK", "bars": len(bars),
+            "price": round(price, 2), "chg": chg}
 
 @app.get("/scan")
 async def scan(
@@ -108,7 +131,7 @@ async def scan(
     bench:   str   = Query("SPY"),
     length:  int   = Query(14, ge=5, le=50),
     mult:    float = Query(1.0, ge=0.5, le=3.0),
-    days:    int   = Query(90, ge=30, le=365),
+    days:    int   = Query(120, ge=30, le=365),
 ):
     sym_list  = [s.strip().upper() for s in symbols.split(",") if s.strip()]
     bench_sym = bench.strip().upper()
@@ -120,7 +143,7 @@ async def scan(
 
     bench_bars, _, _ = await loop.run_in_executor(None, lambda: get_bars(bench_sym))
     if bench_bars is None:
-        return JSONResponse({"error": f"Benchmark {bench_sym} indisponible via Stooq"}, status_code=502)
+        return JSONResponse({"error": f"Benchmark {bench_sym} indisponible"}, status_code=502)
 
     async def fetch(sym):
         b, p, c = await loop.run_in_executor(None, lambda: get_bars(sym))
