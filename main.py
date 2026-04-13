@@ -5,6 +5,7 @@ import yfinance as yf
 import numpy as np
 import asyncio
 import logging
+import time
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -30,10 +31,10 @@ def wilder_atr(bars: np.ndarray, length: int) -> float:
         )
     )
     n = min(length, len(tr))
-    atr = np.mean(tr[:n])
+    atr = float(np.mean(tr[:n]))
     for i in range(n, len(tr)):
-        atr = (atr * (length - 1) + tr[i]) / length
-    return float(atr) if atr > 0 else 1.0
+        atr = (atr * (length - 1) + float(tr[i])) / length
+    return atr if atr > 0 else 1.0
 
 
 def calc_rrs(my_bars, bench_bars, length, mult):
@@ -51,29 +52,67 @@ def calc_rrs(my_bars, bench_bars, length, mult):
     bn_c   = bench_bars[:, 2]
     series = ((my_c[length:] - my_c[:-length]) - (bn_c[length:] - bn_c[:-length])) / atr_avg
     alpha  = 2 / (3 + 1)
-    ema    = series[0]
+    ema    = float(series[0])
     for v in series[1:]:
-        ema = alpha * v + (1 - alpha) * ema
+        ema = alpha * float(v) + (1 - alpha) * ema
     return float(np.clip(ema, -20, 20))
 
 
-async def fetch_symbol(symbol, interval, period):
+def download_with_retry(symbol: str, interval: str, period: str, retries: int = 3):
+    """Télécharge les données avec retry et délai croissant."""
+    for attempt in range(retries):
+        try:
+            df = yf.download(
+                symbol,
+                interval=interval,
+                period=period,
+                progress=False,
+                auto_adjust=True,
+                timeout=30,
+            )
+            if df is not None and not df.empty and len(df) >= 10:
+                return df
+            logger.warning(f"{symbol} tentative {attempt+1}: données vides")
+        except Exception as e:
+            logger.warning(f"{symbol} tentative {attempt+1} erreur: {e}")
+        if attempt < retries - 1:
+            time.sleep(1.5 * (attempt + 1))
+    return None
+
+
+async def fetch_symbol(symbol: str, interval: str, period: str):
     try:
         loop = asyncio.get_event_loop()
         df = await loop.run_in_executor(
             None,
-            lambda: yf.download(symbol, interval=interval, period=period,
-                                 progress=False, auto_adjust=True)
+            lambda: download_with_retry(symbol, interval, period)
         )
-        if df.empty or len(df) < 20:
+        if df is None:
             return symbol, None, None, None
-        bars  = df[["High", "Low", "Close"]].dropna().to_numpy()
+
+        # Aplatir les colonnes MultiIndex si présentes (yfinance >= 0.2.40)
+        if isinstance(df.columns, type(df.columns)) and hasattr(df.columns, 'levels'):
+            df.columns = df.columns.get_level_values(0)
+
+        needed = [c for c in ["High", "Low", "Close"] if c in df.columns]
+        if len(needed) < 3:
+            return symbol, None, None, None
+
+        bars  = df[["High", "Low", "Close"]].dropna().to_numpy(dtype=float)
+        if len(bars) < 10:
+            return symbol, None, None, None
+
         price = float(bars[-1, 2])
-        opens = df["Open"].dropna().to_numpy()
-        chg   = round((price - float(opens[-1])) / float(opens[-1]) * 100, 2) if len(opens) else 0.0
+        chg   = 0.0
+        if "Open" in df.columns:
+            opens = df["Open"].dropna().to_numpy(dtype=float)
+            if len(opens) > 0 and opens[-1] > 0:
+                chg = round((price - float(opens[-1])) / float(opens[-1]) * 100, 2)
+
         return symbol, bars, price, chg
+
     except Exception as e:
-        logger.warning(f"Erreur {symbol}: {e}")
+        logger.error(f"fetch_symbol {symbol}: {e}")
         return symbol, None, None, None
 
 
@@ -81,9 +120,11 @@ async def fetch_symbol(symbol, interval, period):
 def health():
     return {"status": "ok", "message": "Trinity RRS Backend opérationnel"}
 
+
 @app.get("/")
 def root():
     return {"name": "Trinity RRS Scanner API", "version": "1.0.0"}
+
 
 @app.get("/scan")
 async def scan(
@@ -94,42 +135,58 @@ async def scan(
     interval: str   = Query("5m"),
     period:   str   = Query("5d"),
 ):
-    sym_list = [s.strip().upper() for s in symbols.split(",") if s.strip()]
+    sym_list  = [s.strip().upper() for s in symbols.split(",") if s.strip()]
+    bench_sym = bench.strip().upper()
+
     if len(sym_list) > 750:
         return JSONResponse({"error": "Maximum 750 symboles"}, status_code=400)
 
-    all_syms = list(set([bench.upper()] + sym_list))
-    tasks    = [fetch_symbol(s, interval, period) for s in all_syms]
-    results  = await asyncio.gather(*tasks)
+    # Télécharger le benchmark en premier, séparément
+    logger.info(f"Téléchargement benchmark {bench_sym} interval={interval} period={period}")
+    _, bench_bars, _, _ = await fetch_symbol(bench_sym, interval, period)
 
-    data_map, price_map, chg_map = {}, {}, {}
-    for sym, bars, price, chg in results:
-        if bars is not None:
-            data_map[sym]  = bars
-            price_map[sym] = price
-            chg_map[sym]   = chg
+    if bench_bars is None:
+        # Fallback : essayer avec period plus long
+        logger.warning(f"Retry benchmark {bench_sym} avec period=1mo")
+        _, bench_bars, _, _ = await fetch_symbol(bench_sym, interval, "1mo")
 
-    bench_sym = bench.upper()
-    if bench_sym not in data_map:
-        return JSONResponse({"error": f"Benchmark {bench_sym} indisponible"}, status_code=502)
+    if bench_bars is None:
+        return JSONResponse(
+            {"error": f"Impossible de récupérer le benchmark {bench_sym}. "
+                      f"Vérifiez que le marché est ouvert ou essayez interval=1d period=1mo"},
+            status_code=502
+        )
 
-    bench_bars = data_map[bench_sym]
+    logger.info(f"Benchmark OK: {len(bench_bars)} barres. Scan de {len(sym_list)} symboles...")
+
+    # Téléchargement parallèle de tous les symboles
+    tasks   = [fetch_symbol(s, interval, period) for s in sym_list]
+    results = await asyncio.gather(*tasks)
+
     output = []
-    for sym in sym_list:
+    for sym, bars, price, chg in results:
         if sym == bench_sym:
             continue
-        if sym not in data_map:
+        if bars is None:
             output.append({"symbol": sym, "rrs": None, "price": None, "chg": None, "error": "no_data"})
             continue
-        rrs = calc_rrs(data_map[sym], bench_bars, length, mult)
+        rrs = calc_rrs(bars, bench_bars, length, mult)
         output.append({
             "symbol": sym,
-            "rrs":   round(rrs, 2) if rrs is not None else None,
-            "price": round(price_map[sym], 2),
-            "chg":   chg_map[sym],
-            "error": None,
+            "rrs":    round(rrs, 2) if rrs is not None else None,
+            "price":  round(price, 2),
+            "chg":    chg,
+            "error":  None,
         })
 
     output.sort(key=lambda x: (x["rrs"] is None, -(x["rrs"] or -999)))
-    return {"benchmark": bench_sym, "length": length, "mult": mult,
-            "interval": interval, "count": len(output), "results": output}
+
+    return {
+        "benchmark": bench_sym,
+        "length":    length,
+        "mult":      mult,
+        "interval":  interval,
+        "period":    period,
+        "count":     len(output),
+        "results":   output,
+    }
