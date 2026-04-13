@@ -6,12 +6,11 @@ import numpy as np
 import asyncio
 import logging
 import time
-import requests
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Trinity RRS Scanner API", version="1.0.0")
+app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
@@ -21,25 +20,12 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Session avec User-Agent navigateur pour contourner le blocage Yahoo
-SESSION = requests.Session()
-SESSION.headers.update({
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.5",
-    "Accept-Encoding": "gzip, deflate, br",
-    "Connection": "keep-alive",
-})
 
-
-def wilder_atr(bars: np.ndarray, length: int) -> float:
+def wilder_atr(bars, length):
     highs, lows, closes = bars[:, 0], bars[:, 1], bars[:, 2]
     tr = np.maximum(
         highs[1:] - lows[1:],
-        np.maximum(
-            np.abs(highs[1:] - closes[:-1]),
-            np.abs(lows[1:] - closes[:-1])
-        )
+        np.maximum(np.abs(highs[1:] - closes[:-1]), np.abs(lows[1:] - closes[:-1]))
     )
     n = min(length, len(tr))
     atr = float(np.mean(tr[:n]))
@@ -52,85 +38,62 @@ def calc_rrs(my_bars, bench_bars, length, mult):
     n = min(len(my_bars), len(bench_bars))
     if n < length + 5:
         return None
-    my_bars    = my_bars[-n:]
+    my_bars = my_bars[-n:]
     bench_bars = bench_bars[-n:]
-    my_atr     = wilder_atr(my_bars, length)
-    bench_atr  = wilder_atr(bench_bars, length)
-    atr_avg    = ((my_atr + bench_atr) / 2) * mult or my_atr or 1.0
-    my_c   = my_bars[:, 2]
-    bn_c   = bench_bars[:, 2]
+    atr_avg = ((wilder_atr(my_bars, length) + wilder_atr(bench_bars, length)) / 2) * mult or 1.0
+    my_c = my_bars[:, 2]
+    bn_c = bench_bars[:, 2]
     series = ((my_c[length:] - my_c[:-length]) - (bn_c[length:] - bn_c[:-length])) / atr_avg
-    alpha  = 2 / (3 + 1)
-    ema    = float(series[0])
+    ema = float(series[0])
     for v in series[1:]:
-        ema = alpha * float(v) + (1 - alpha) * ema
+        ema = 0.5 * float(v) + 0.5 * ema
     return float(np.clip(ema, -20, 20))
 
 
-def download_symbol(symbol: str, interval: str, period: str):
-    """Télécharge avec session custom et retry x3."""
-    combos = [(interval, period), ("1d", "1mo"), ("1d", "3mo")]
-    for iv, pr in combos:
-        for attempt in range(3):
-            try:
-                ticker = yf.Ticker(symbol, session=SESSION)
-                df = ticker.history(interval=iv, period=pr, auto_adjust=True)
-                if df is not None and not df.empty and len(df) >= 10:
-                    logger.info(f"{symbol} OK: {len(df)} barres ({iv}/{pr})")
-                    return df
-                logger.warning(f"{symbol} vide tentative {attempt+1} ({iv}/{pr})")
-            except Exception as e:
-                logger.warning(f"{symbol} erreur tentative {attempt+1}: {e}")
-            time.sleep(1)
-    return None
+def get_bars(symbol, interval, period):
+    for attempt in range(3):
+        try:
+            df = yf.download(symbol, interval=interval, period=period,
+                             progress=False, auto_adjust=True)
+            if df is not None and not df.empty and len(df) >= 15:
+                # Aplatir MultiIndex si nécessaire
+                if hasattr(df.columns, 'levels'):
+                    df.columns = [c[0] if isinstance(c, tuple) else c for c in df.columns]
+                bars = df[["High", "Low", "Close"]].dropna().to_numpy(dtype=float)
+                if len(bars) >= 15:
+                    price = float(bars[-1, 2])
+                    chg = 0.0
+                    if "Open" in df.columns:
+                        o = df["Open"].dropna().to_numpy(dtype=float)
+                        if len(o) > 0 and o[-1] > 0:
+                            chg = round((price - float(o[-1])) / float(o[-1]) * 100, 2)
+                    return bars, price, chg
+        except Exception as e:
+            logger.warning(f"{symbol} attempt {attempt+1}: {e}")
+        time.sleep(2)
+    return None, None, None
 
 
-def df_to_bars(df):
-    """Convertit un DataFrame yfinance en array numpy HLC."""
-    cols = {c.lower(): c for c in df.columns}
-    h = cols.get("high", "High")
-    l = cols.get("low", "Low")
-    c = cols.get("close", "Close")
-    bars = df[[h, l, c]].dropna().to_numpy(dtype=float)
-    return bars if len(bars) >= 10 else None
-
-
-async def fetch_symbol(symbol: str, interval: str, period: str):
-    try:
-        loop = asyncio.get_event_loop()
-        df = await loop.run_in_executor(None, lambda: download_symbol(symbol, interval, period))
-        if df is None:
-            return symbol, None, None, None
-        bars  = df_to_bars(df)
-        if bars is None:
-            return symbol, None, None, None
-        price = float(bars[-1, 2])
-        chg   = 0.0
-        if "Open" in df.columns:
-            opens = df["Open"].dropna().to_numpy(dtype=float)
-            if len(opens) > 0 and opens[-1] > 0:
-                chg = round((price - float(opens[-1])) / float(opens[-1]) * 100, 2)
-        return symbol, bars, price, chg
-    except Exception as e:
-        logger.error(f"fetch_symbol {symbol}: {e}")
-        return symbol, None, None, None
+@app.get("/")
+def root():
+    return {"status": "ok", "name": "Trinity RRS Scanner"}
 
 
 @app.get("/health")
 def health():
     return {"status": "ok", "message": "Trinity RRS Backend opérationnel"}
 
-@app.get("/")
-def root():
-    return {"name": "Trinity RRS Scanner API", "version": "1.0.0"}
 
 @app.get("/test/{symbol}")
-async def test_symbol(symbol: str):
-    """Debug: teste le téléchargement d'un symbole."""
-    sym, bars, price, chg = await fetch_symbol(symbol.upper(), "1d", "1mo")
+async def test(symbol: str):
+    loop = asyncio.get_event_loop()
+    bars, price, chg = await loop.run_in_executor(
+        None, lambda: get_bars(symbol.upper(), "1d", "1mo")
+    )
     if bars is None:
-        return {"symbol": sym, "status": "ERREUR", "bars": 0}
-    return {"symbol": sym, "status": "OK", "bars": len(bars), "last_price": round(price, 2)}
+        return {"symbol": symbol.upper(), "status": "ERREUR", "bars": 0}
+    return {"symbol": symbol.upper(), "status": "OK", "bars": len(bars), "price": round(price, 2)}
+
 
 @app.get("/scan")
 async def scan(
@@ -147,22 +110,24 @@ async def scan(
     if len(sym_list) > 750:
         return JSONResponse({"error": "Maximum 750 symboles"}, status_code=400)
 
-    logger.info(f"Scan: bench={bench_sym} interval={interval} period={period} symbols={len(sym_list)}")
+    loop = asyncio.get_event_loop()
 
-    _, bench_bars, _, _ = await fetch_symbol(bench_sym, interval, period)
+    # Benchmark
+    bench_bars, _, _ = await loop.run_in_executor(
+        None, lambda: get_bars(bench_sym, interval, period)
+    )
     if bench_bars is None:
-        return JSONResponse(
-            {"error": f"Benchmark {bench_sym} indisponible — essayez /test/{bench_sym} pour diagnostiquer"},
-            status_code=502
-        )
+        return JSONResponse({"error": f"Benchmark {bench_sym} indisponible"}, status_code=502)
 
-    tasks   = [fetch_symbol(s, interval, period) for s in sym_list]
+    # Symboles en parallèle (par batch de 10 pour éviter le throttle)
+    async def fetch(sym):
+        return sym, *await loop.run_in_executor(None, lambda: get_bars(sym, interval, period))
+
+    tasks = [fetch(s) for s in sym_list]
     results = await asyncio.gather(*tasks)
 
     output = []
     for sym, bars, price, chg in results:
-        if sym == bench_sym:
-            continue
         if bars is None:
             output.append({"symbol": sym, "rrs": None, "price": None, "chg": None, "error": "no_data"})
             continue
@@ -176,8 +141,4 @@ async def scan(
         })
 
     output.sort(key=lambda x: (x["rrs"] is None, -(x["rrs"] or -999)))
-    return {
-        "benchmark": bench_sym, "length": length, "mult": mult,
-        "interval": interval, "period": period,
-        "count": len(output), "results": output,
-    }
+    return {"benchmark": bench_sym, "count": len(output), "results": output}
