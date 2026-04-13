@@ -1,11 +1,12 @@
+
 from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-import yfinance as yf
+import pandas_datareader as pdr
 import numpy as np
 import asyncio
 import logging
-import time
+from datetime import datetime, timedelta
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -38,7 +39,7 @@ def calc_rrs(my_bars, bench_bars, length, mult):
     n = min(len(my_bars), len(bench_bars))
     if n < length + 5:
         return None
-    my_bars = my_bars[-n:]
+    my_bars    = my_bars[-n:]
     bench_bars = bench_bars[-n:]
     atr_avg = ((wilder_atr(my_bars, length) + wilder_atr(bench_bars, length)) / 2) * mult or 1.0
     my_c = my_bars[:, 2]
@@ -50,33 +51,40 @@ def calc_rrs(my_bars, bench_bars, length, mult):
     return float(np.clip(ema, -20, 20))
 
 
-def get_bars(symbol, interval, period):
-    for attempt in range(3):
-        try:
-            df = yf.download(symbol, interval=interval, period=period,
-                             progress=False, auto_adjust=True)
-            if df is not None and not df.empty and len(df) >= 15:
-                # Aplatir MultiIndex si nécessaire
-                if hasattr(df.columns, 'levels'):
-                    df.columns = [c[0] if isinstance(c, tuple) else c for c in df.columns]
-                bars = df[["High", "Low", "Close"]].dropna().to_numpy(dtype=float)
-                if len(bars) >= 15:
-                    price = float(bars[-1, 2])
-                    chg = 0.0
-                    if "Open" in df.columns:
-                        o = df["Open"].dropna().to_numpy(dtype=float)
-                        if len(o) > 0 and o[-1] > 0:
-                            chg = round((price - float(o[-1])) / float(o[-1]) * 100, 2)
-                    return bars, price, chg
-        except Exception as e:
-            logger.warning(f"{symbol} attempt {attempt+1}: {e}")
-        time.sleep(2)
-    return None, None, None
+def get_bars(symbol: str, days: int = 90):
+    """Télécharge via Stooq (pas bloqué par Render, gratuit, sans API key)."""
+    end   = datetime.today()
+    start = end - timedelta(days=days)
+    try:
+        # Stooq utilise le suffixe .US pour les actions américaines
+        stooq_sym = f"{symbol}.US" if "." not in symbol else symbol
+        df = pdr.get_data_stooq(stooq_sym, start=start, end=end)
+        if df is None or df.empty:
+            # Retry sans suffixe
+            df = pdr.get_data_stooq(symbol, start=start, end=end)
+        if df is None or df.empty or len(df) < 15:
+            logger.warning(f"{symbol}: données vides depuis Stooq")
+            return None, None, None
+        df = df.sort_index()  # Stooq retourne en ordre décroissant
+        bars  = df[["High", "Low", "Close"]].dropna().to_numpy(dtype=float)
+        if len(bars) < 15:
+            return None, None, None
+        price = float(bars[-1, 2])
+        chg   = 0.0
+        if "Open" in df.columns:
+            opens = df["Open"].dropna().to_numpy(dtype=float)
+            if len(opens) > 0 and opens[-1] > 0:
+                chg = round((price - float(opens[-1])) / float(opens[-1]) * 100, 2)
+        logger.info(f"{symbol} OK: {len(bars)} barres, prix={price:.2f}")
+        return bars, price, chg
+    except Exception as e:
+        logger.error(f"{symbol} erreur Stooq: {e}")
+        return None, None, None
 
 
 @app.get("/")
 def root():
-    return {"status": "ok", "name": "Trinity RRS Scanner"}
+    return {"status": "ok", "name": "Trinity RRS Scanner", "source": "Stooq"}
 
 
 @app.get("/health")
@@ -87,22 +95,20 @@ def health():
 @app.get("/test/{symbol}")
 async def test(symbol: str):
     loop = asyncio.get_event_loop()
-    bars, price, chg = await loop.run_in_executor(
-        None, lambda: get_bars(symbol.upper(), "1d", "1mo")
-    )
+    bars, price, chg = await loop.run_in_executor(None, lambda: get_bars(symbol.upper()))
     if bars is None:
-        return {"symbol": symbol.upper(), "status": "ERREUR", "bars": 0}
+        return {"symbol": symbol.upper(), "status": "ERREUR", "bars": 0,
+                "hint": "Stooq ne couvre pas tous les tickers (ETFs parfois absents)"}
     return {"symbol": symbol.upper(), "status": "OK", "bars": len(bars), "price": round(price, 2)}
 
 
 @app.get("/scan")
 async def scan(
-    symbols:  str   = Query(...),
-    bench:    str   = Query("SPY"),
-    length:   int   = Query(14, ge=5, le=50),
-    mult:     float = Query(1.0, ge=0.5, le=3.0),
-    interval: str   = Query("1d"),
-    period:   str   = Query("1mo"),
+    symbols: str   = Query(...),
+    bench:   str   = Query("SPY"),
+    length:  int   = Query(14, ge=5, le=50),
+    mult:    float = Query(1.0, ge=0.5, le=3.0),
+    days:    int   = Query(90, ge=30, le=365),
 ):
     sym_list  = [s.strip().upper() for s in symbols.split(",") if s.strip()]
     bench_sym = bench.strip().upper()
@@ -112,19 +118,15 @@ async def scan(
 
     loop = asyncio.get_event_loop()
 
-    # Benchmark
-    bench_bars, _, _ = await loop.run_in_executor(
-        None, lambda: get_bars(bench_sym, interval, period)
-    )
+    bench_bars, _, _ = await loop.run_in_executor(None, lambda: get_bars(bench_sym))
     if bench_bars is None:
-        return JSONResponse({"error": f"Benchmark {bench_sym} indisponible"}, status_code=502)
+        return JSONResponse({"error": f"Benchmark {bench_sym} indisponible via Stooq"}, status_code=502)
 
-    # Symboles en parallèle (par batch de 10 pour éviter le throttle)
     async def fetch(sym):
-        return sym, *await loop.run_in_executor(None, lambda: get_bars(sym, interval, period))
+        b, p, c = await loop.run_in_executor(None, lambda: get_bars(sym))
+        return sym, b, p, c
 
-    tasks = [fetch(s) for s in sym_list]
-    results = await asyncio.gather(*tasks)
+    results = await asyncio.gather(*[fetch(s) for s in sym_list])
 
     output = []
     for sym, bars, price, chg in results:
@@ -141,4 +143,5 @@ async def scan(
         })
 
     output.sort(key=lambda x: (x["rrs"] is None, -(x["rrs"] or -999)))
-    return {"benchmark": bench_sym, "count": len(output), "results": output}
+    return {"benchmark": bench_sym, "source": "Stooq",
+            "count": len(output), "results": output}
