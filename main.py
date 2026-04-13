@@ -6,6 +6,7 @@ import numpy as np
 import asyncio
 import logging
 import time
+import requests
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -19,6 +20,16 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Session avec User-Agent navigateur pour contourner le blocage Yahoo
+SESSION = requests.Session()
+SESSION.headers.update({
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.5",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Connection": "keep-alive",
+})
 
 
 def wilder_atr(bars: np.ndarray, length: int) -> float:
@@ -45,9 +56,7 @@ def calc_rrs(my_bars, bench_bars, length, mult):
     bench_bars = bench_bars[-n:]
     my_atr     = wilder_atr(my_bars, length)
     bench_atr  = wilder_atr(bench_bars, length)
-    atr_avg    = ((my_atr + bench_atr) / 2) * mult
-    if atr_avg <= 0:
-        atr_avg = my_atr or 1.0
+    atr_avg    = ((my_atr + bench_atr) / 2) * mult or my_atr or 1.0
     my_c   = my_bars[:, 2]
     bn_c   = bench_bars[:, 2]
     series = ((my_c[length:] - my_c[:-length]) - (bn_c[length:] - bn_c[:-length])) / atr_avg
@@ -58,59 +67,50 @@ def calc_rrs(my_bars, bench_bars, length, mult):
     return float(np.clip(ema, -20, 20))
 
 
-def download_with_retry(symbol: str, interval: str, period: str, retries: int = 3):
-    """Télécharge les données avec retry et délai croissant."""
-    for attempt in range(retries):
-        try:
-            df = yf.download(
-                symbol,
-                interval=interval,
-                period=period,
-                progress=False,
-                auto_adjust=True,
-                timeout=30,
-            )
-            if df is not None and not df.empty and len(df) >= 10:
-                return df
-            logger.warning(f"{symbol} tentative {attempt+1}: données vides")
-        except Exception as e:
-            logger.warning(f"{symbol} tentative {attempt+1} erreur: {e}")
-        if attempt < retries - 1:
-            time.sleep(1.5 * (attempt + 1))
+def download_symbol(symbol: str, interval: str, period: str):
+    """Télécharge avec session custom et retry x3."""
+    combos = [(interval, period), ("1d", "1mo"), ("1d", "3mo")]
+    for iv, pr in combos:
+        for attempt in range(3):
+            try:
+                ticker = yf.Ticker(symbol, session=SESSION)
+                df = ticker.history(interval=iv, period=pr, auto_adjust=True)
+                if df is not None and not df.empty and len(df) >= 10:
+                    logger.info(f"{symbol} OK: {len(df)} barres ({iv}/{pr})")
+                    return df
+                logger.warning(f"{symbol} vide tentative {attempt+1} ({iv}/{pr})")
+            except Exception as e:
+                logger.warning(f"{symbol} erreur tentative {attempt+1}: {e}")
+            time.sleep(1)
     return None
+
+
+def df_to_bars(df):
+    """Convertit un DataFrame yfinance en array numpy HLC."""
+    cols = {c.lower(): c for c in df.columns}
+    h = cols.get("high", "High")
+    l = cols.get("low", "Low")
+    c = cols.get("close", "Close")
+    bars = df[[h, l, c]].dropna().to_numpy(dtype=float)
+    return bars if len(bars) >= 10 else None
 
 
 async def fetch_symbol(symbol: str, interval: str, period: str):
     try:
         loop = asyncio.get_event_loop()
-        df = await loop.run_in_executor(
-            None,
-            lambda: download_with_retry(symbol, interval, period)
-        )
+        df = await loop.run_in_executor(None, lambda: download_symbol(symbol, interval, period))
         if df is None:
             return symbol, None, None, None
-
-        # Aplatir les colonnes MultiIndex si présentes (yfinance >= 0.2.40)
-        if isinstance(df.columns, type(df.columns)) and hasattr(df.columns, 'levels'):
-            df.columns = df.columns.get_level_values(0)
-
-        needed = [c for c in ["High", "Low", "Close"] if c in df.columns]
-        if len(needed) < 3:
+        bars  = df_to_bars(df)
+        if bars is None:
             return symbol, None, None, None
-
-        bars  = df[["High", "Low", "Close"]].dropna().to_numpy(dtype=float)
-        if len(bars) < 10:
-            return symbol, None, None, None
-
         price = float(bars[-1, 2])
         chg   = 0.0
         if "Open" in df.columns:
             opens = df["Open"].dropna().to_numpy(dtype=float)
             if len(opens) > 0 and opens[-1] > 0:
                 chg = round((price - float(opens[-1])) / float(opens[-1]) * 100, 2)
-
         return symbol, bars, price, chg
-
     except Exception as e:
         logger.error(f"fetch_symbol {symbol}: {e}")
         return symbol, None, None, None
@@ -120,11 +120,17 @@ async def fetch_symbol(symbol: str, interval: str, period: str):
 def health():
     return {"status": "ok", "message": "Trinity RRS Backend opérationnel"}
 
-
 @app.get("/")
 def root():
     return {"name": "Trinity RRS Scanner API", "version": "1.0.0"}
 
+@app.get("/test/{symbol}")
+async def test_symbol(symbol: str):
+    """Debug: teste le téléchargement d'un symbole."""
+    sym, bars, price, chg = await fetch_symbol(symbol.upper(), "1d", "1mo")
+    if bars is None:
+        return {"symbol": sym, "status": "ERREUR", "bars": 0}
+    return {"symbol": sym, "status": "OK", "bars": len(bars), "last_price": round(price, 2)}
 
 @app.get("/scan")
 async def scan(
@@ -132,8 +138,8 @@ async def scan(
     bench:    str   = Query("SPY"),
     length:   int   = Query(14, ge=5, le=50),
     mult:     float = Query(1.0, ge=0.5, le=3.0),
-    interval: str   = Query("5m"),
-    period:   str   = Query("5d"),
+    interval: str   = Query("1d"),
+    period:   str   = Query("1mo"),
 ):
     sym_list  = [s.strip().upper() for s in symbols.split(",") if s.strip()]
     bench_sym = bench.strip().upper()
@@ -141,25 +147,15 @@ async def scan(
     if len(sym_list) > 750:
         return JSONResponse({"error": "Maximum 750 symboles"}, status_code=400)
 
-    # Télécharger le benchmark en premier, séparément
-    logger.info(f"Téléchargement benchmark {bench_sym} interval={interval} period={period}")
+    logger.info(f"Scan: bench={bench_sym} interval={interval} period={period} symbols={len(sym_list)}")
+
     _, bench_bars, _, _ = await fetch_symbol(bench_sym, interval, period)
-
-    if bench_bars is None:
-        # Fallback : essayer avec period plus long
-        logger.warning(f"Retry benchmark {bench_sym} avec period=1mo")
-        _, bench_bars, _, _ = await fetch_symbol(bench_sym, interval, "1mo")
-
     if bench_bars is None:
         return JSONResponse(
-            {"error": f"Impossible de récupérer le benchmark {bench_sym}. "
-                      f"Vérifiez que le marché est ouvert ou essayez interval=1d period=1mo"},
+            {"error": f"Benchmark {bench_sym} indisponible — essayez /test/{bench_sym} pour diagnostiquer"},
             status_code=502
         )
 
-    logger.info(f"Benchmark OK: {len(bench_bars)} barres. Scan de {len(sym_list)} symboles...")
-
-    # Téléchargement parallèle de tous les symboles
     tasks   = [fetch_symbol(s, interval, period) for s in sym_list]
     results = await asyncio.gather(*tasks)
 
@@ -180,13 +176,8 @@ async def scan(
         })
 
     output.sort(key=lambda x: (x["rrs"] is None, -(x["rrs"] or -999)))
-
     return {
-        "benchmark": bench_sym,
-        "length":    length,
-        "mult":      mult,
-        "interval":  interval,
-        "period":    period,
-        "count":     len(output),
-        "results":   output,
+        "benchmark": bench_sym, "length": length, "mult": mult,
+        "interval": interval, "period": period,
+        "count": len(output), "results": output,
     }
